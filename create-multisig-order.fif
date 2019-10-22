@@ -1,0 +1,69 @@
+#!/usr/bin/env fift -s
+"TonUtil.fif" include
+
+{ ."usage: " @' $0 type ." <wallet-addr> <dest-addr> <seqno> <amount> <order-timeout> [-B <body-boc>] [-C <transfer-comment>] [<savefile>]" cr
+  ."Creates new order message to multisig wallet with address from <filename-base>.addr"
+  ."and header without sigs, and saves it into <savefile>.boc ('new-order.boc' by default)" cr 1 halt
+} : usage
+"" =: comment  // comment for simple transfers
+def? $7
+{
+@' $6 dup "-B" $= swap "-C" $= tuck or
+  {
+    @' $7 swap { =: comment } { =: body-boc-file } cond [forget] $7
+    def? $8 { @' $8 =: $6 [forget] $8 } { [forget] $6 } cond
+    @' $# 2- =: $#
+  } if
+} if
+$# dup 5 < swap 6 > or ' usage if
+
+true constant bounce
+
+$1 bounce parse-load-address =: bounce 2=: wallet-addr
+$2 bounce parse-load-address =: bounce 2=: dest-addr
+$3 parse-int =: seqno
+$4 $>GR =: amount
+$5 parse-int =: order-timeout
+def? $6 { @' $6 } { "new-order" } cond constant savefile
+3 constant send-mode  // mode for SENDRAWMSG: +1 - sender pays fees, +2 - ignore errors
+// "" 1 { 69091 * 1+ 65535 and tuck 2521 / 65 + hold swap } 1000 times drop =: comment
+
+."Source wallet address = " wallet-addr 2dup .addr cr 6 .Addr cr
+
+def? body-boc-file { @' body-boc-file file>B B>boc } { comment simple-transfer-body } cond
+constant body-cell
+
+."Transferring " amount .GR ."to account "
+dest-addr 2dup bounce 7 + .Addr ." = " .addr
+."seqno=0x" seqno x. ."bounce=" bounce . cr
+."Body of transfer message is " body-cell <s csr. cr
+
+// create a message
+<b b{01} s, bounce 1 i, b{000100} s, dest-addr addr, amount Gram, 0 9 64 32 + + 1+ u,
+  body-cell <s 2dup s-fits? not rot over 1 i, -rot { drop body-cell ref, } { s, } cond
+b>
+<b
+now 64 u, // cookie
+order-timeout 32 u,
+send-mode 8 u,
+swap ref,
+b> // order body
+
+dup dup ."Order body: " <s csr. cr
+."Order body hash: " hashu . cr
+
+dictnew // dict for sigs
+<b
+b{1000100} s,
+wallet-addr addr,
+0 Gram,
+b{00} s,
+seqno 32 u,
+swap dict,
+swap <s s, // store order body
+b>
+
+dup ."resulting external message: " <s csr. cr
+2 boc+>B dup Bx. cr
+savefile +".boc" tuck B>file
+."(Saved to file " type .")" cr

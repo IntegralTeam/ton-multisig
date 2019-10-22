@@ -1,0 +1,139 @@
+#!/usr/bin/env fift -s
+"TonUtil.fif" include
+"Asm.fif" include
+
+{ ."usage: " @' $0 type ."<num-of-keys> <neccessary-sigs-num> <workchain-id> <generate?> <filename-base>" cr
+  ."Creates a new multisig wallet in specified workchain," cr
+  ."where 1 <= <num-of-keys> <= 3 and 1<= <neccessary-sigs-num> <= <num-of-keys>." cr
+  ."If <generate?> param is 0 try to load private keys from <filename-base>-(1..n).pk files." cr
+  ."(e.g. num-of-keys=3, filename-base = my-key, neccessary files: my-key-1.pk, my-key-2.pk, my-key-3.pk)." cr
+  ."Otherwise neccessary key pairs will be generated and private keys will be written to <filename-base>-(1..n).pk files" cr
+  1 halt // exit
+} : usage
+$# 5 <> ' usage if
+
+".pk" constant privkey-file-ext
+".pub" constant pubkey-file-ext
+
+$1 parse-int =: num-of-keys
+// Now we just hardcode 3 pubkeys and contain them into 1 cell
+// because in TVM reading from pubkeys dict in the nested loop is buged yet
+// 3 =: num-of-keys
+num-of-keys dup 1 < swap 10 > + ' usage if
+$2 parse-int =: neccessary-sigs-num
+neccessary-sigs-num dup 1 < swap num-of-keys > + ' usage if
+$3 parse-workchain-id =: wc    // set workchain id from command line argument
+$4 parse-int =: need-generate
+$5 =: file-base
+
+// loop cnt
+1 box constant cnt
+| | // pubk-tuple, privk-tuple
+{ // begin iteration stack: pubk-tuple, privk-tuple
+  file-base +"-" cnt @ (.) $+ =: file-base-cnt // convert cnt to str and define filename
+  @' file-base-cnt privkey-file-ext $+
+  // stack: pubk-tuple, privk-tuple, "file-base-cnt.pk"
+  need-generate
+  {
+    dup newkeypair swap rot over swap B>file
+    rot ."Saved new private key to file " type cr
+  }
+  {
+    dup file-exists? { dup "File " swap $+ +" is not exist." abort } ifnot
+    load-keypair
+  } cond
+  // stack: privk-tuple, pubk-tuple, pubk, privk
+  rot swap , -rot // add privk to tuple
+  // stack: privk-tuple, pubk-tuple, pubk
+  "Pubkey-" cnt @ (.) $+ +"= " type dup 256 B>u@ . cr
+  , swap // add pubk to tuple
+  cnt 1+! // cnt++
+} num-of-keys times // end iteration stack: pubk-tuple, privk-tuple
+num-of-keys 1- [] =: wallet-pk // save first privkey for wallet creation
+=: pubk-tuple // save pubkeys tuple
+
+."Creating new multisig wallet in workchain " wc . cr
+
+// PROGRAM
+"multisig-wallet-code.fif" include
+dup =: tvm-code
+
+// Data cell: (seqno), (neccessary-sigs), (num-of-keys), (keys_dict)
+<b // builder for Data
+0 32 u, // store seqno
+neccessary-sigs-num 32 u, // store neccessary-sigs
+num-of-keys 32 u, // store num-of-keys
+// unpack pub keys from tuple
+@' pubk-tuple num-of-keys untuple
+dictnew
+0 cnt !
+{ // begin iteration stack: {pubk_0, .., pubk_n}, pubk_dict
+  <b rot B, // put key to builder
+  cnt @ rot 8 b>udict!+ { "Cannot add publickey to dict." abort } ifnot // add pubkey to dict
+  cnt 1+! // cnt ++
+} num-of-keys times // end iteration stack: {pubk_0, .., pubk_n-1}, pubk_dict
+dict, // store keys_dict
+dictnew dict, // store orders_dict
+dictnew dict, // store orders_cookie_dict
+b> // c<Data>
+dup =: cell-data
+dup ."Data: " cr <s csr. cr
+null // no libraries
+// Libs{ x{ABACABADABACABA} drop x{AAAA} s>c public_lib x{1234} x{5678} |_ s>c public_lib }Libs
+<b b{0011} s, 3 roll ref, rot ref, swap dict, b>  // create StateInit
+dup ."StateInit: " cr <s csr. cr
+dup hashu wc swap 2dup 2constant wallet-addr
+."new wallet address = " 2dup .addr cr
+2dup file-base +".addr" save-address-verbose
+."Non-bounceable address (for init): " 2dup 7 .Addr cr
+."Bounceable address (for later access): " 6 .Addr cr
+
+<b 0 64 u, 0 32 u, b> // msg body (cookie, timeout)
+dup ."signing message: " <s csr. cr
+
+// stack: c<StateInit>, c<msg_body>
+dup hashu wallet-pk ed25519_sign_uint // sign msg
+<b swap B, 0 dictnew 8 b>udict!+ { "Cannot add sig to dict." abort } ifnot // store sig into dict
+dup =: sigs-dict
+rot
+// stack: c<msg_body>, sigs-dict, c<StateInit>
+<b // builder for external message
+b{1000100} s, // store magic
+wallet-addr addr, // store address
+b{000010} s, // store magic
+swap <s s, // store StateInit
+b{0} s, // store magic
+0 32 u,  // store seq_num
+swap dict, // store sigs_dict
+swap <s s, // store msg_body
+b> // External Message
+dup ."External message for initialization is " <s csr. cr
+2 boc+>B dup Bx. cr
+"multisig-wallet-query.boc" tuck B>file
+."(Saved wallet creating query to file " type .")" cr
+
+// 1 halt
+
+// DEBUG
+
+cr cr cr
+."Run TVM enviroment." cr
+
+// create extr init msg
+<b
+0 32 u,  // store seq_num
+sigs-dict dict, // store sigs-dict
+<b 0 64 u, 0 32 u, b> <s s, // store msg body (cookie, timeout)
+b> <s
+-1 // push method id (recv_external)
+
+tvm-code <s
+cell-data
+124711402 0 0 now 1 1 now 50000000000 null pair wallet-addr nip null 10 tuple single
+20000
+gasrunvmctx
+drop
+dup ."New storage: " <s csr. cr
+boc>B "persistent-data.boc" B>file
+
+

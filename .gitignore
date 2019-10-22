@@ -1,0 +1,5 @@
+*.boc
+*.pk
+*.addr
+*.pub
+*-code.fif

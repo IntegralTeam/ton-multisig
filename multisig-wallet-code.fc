@@ -1,0 +1,210 @@
+;; Multisig wallet smart contract
+;; exception codes:
+;; 33 - invalid seq_num
+;; 34 - empty, invalid or repeated signatures
+;; 35 - reusing order cookie
+;; 36 - dict operation error
+
+;; load data from persistent storage
+(int, int, int, cell, cell, cell) load_data() {
+  var ds = get_data().begin_parse();
+  var res = (ds~load_uint(32), ds~load_uint(32), ds~load_uint(32), ds~load_dict(), ds~load_dict(), ds~load_dict());
+  ds.end_parse();
+  return res;
+}
+
+;; procedure for sending order messages
+() send_order(slice order_msg) impure {
+  while (order_msg.slice_refs()) {
+    var mode = order_msg~load_uint(8);
+    send_raw_message(order_msg~load_ref(), mode);
+  }
+}
+
+(cell) prune_old_orders(cell orders_dict) impure {
+  int pos = -1;
+  int time = now();
+  do {
+    (pos, slice order, int ret) = orders_dict.udict_get_next?(256, pos);
+    if (ret) {
+      int expiration_time = order.preload_uint(32);
+      if (expiration_time <= time) {
+        (orders_dict, ret) = orders_dict.udict_delete?(256, pos);
+        throw_unless(36, ret);
+      }
+    }
+  } until (~ ret);
+  return orders_dict;
+}
+
+;; method for checking signatures and confirm unique of them
+;; if the dict contain invalid or repeated sig - throws exception
+(int, int) check_signatures(int hash, cell sigs_dict, cell pubkeys_dict, int confirmed_keys_bits) impure {
+  int confirmed_sigs = 0;
+  int sig_pos = -1;
+  do {
+    (sig_pos, slice sig, int ret1) = sigs_dict.udict_get_next?(8, sig_pos);
+    if (ret1) {
+      int confirmed = 0;
+      int pubkey_pos = 0;
+      do {
+        int ret2 = -1;
+        ifnot ((1 << pubkey_pos) & confirmed_keys_bits) {
+          (slice pubks, ret2) = pubkeys_dict.udict_get?(8, pubkey_pos);
+          if (ret2) {
+            int pubk_i = pubks.preload_uint(256);
+            if (check_signature(hash, sig, pubk_i)) {
+              confirmed_sigs += 1;
+              confirmed_keys_bits |= (1 << pubkey_pos);
+              confirmed = 1;
+            }
+          }
+        }
+        pubkey_pos += 1;
+      } until ((~ ret2) | confirmed);
+      ;; invalid or repeated signature
+      throw_unless(34, confirmed);
+    }
+  } until (~ ret1);
+  return (confirmed_sigs, confirmed_keys_bits);
+}
+
+() set_gaslimit(int gaslimit) impure asm "SETGASLIMIT";
+
+() recv_internal(slice in_msg) impure {
+  ;; do nothing for internal messages
+}
+
+() recv_external(slice in_msg) impure {
+  int msg_seqno = in_msg~load_uint(32);
+  cell sigs_dict = in_msg~load_dict();
+  int order_hash = slice_hash(in_msg);
+  (int stored_seqno, int neccessary_sigs_num, int pubkeys_num, cell pubkeys_dict, cell orders_dict, cell order_cookies_dict) = load_data();
+  throw_unless(33, msg_seqno == stored_seqno);
+  throw_if(34, sigs_dict.dict_empty?());
+  ;; init message
+  if (msg_seqno == 0) {
+    ;; for initialization need at least one valid sig
+    (int confirmed_sigs, int confirmed_keys_bits) = check_signatures(order_hash, sigs_dict, pubkeys_dict, 0);
+    ;; we need use this check, else optimizer will remove prev call
+    accept_message();
+  }
+  else {
+    set_gaslimit(10000 + (pubkeys_num * neccessary_sigs_num * 1000));
+    ;; prune old orders
+    orders_dict = prune_old_orders(orders_dict);
+    ;; try to find this order or create it
+    (slice order, int ret) = orders_dict.udict_get?(256, order_hash);
+    if (ret) {
+      ;; handle sign of existed order
+      (int expiration_time, int confirmed_sigs, int confirmed_keys_bits) =
+        (order~load_uint(32), order~load_uint(32), order~load_uint(256));
+
+      ;; start check sigs
+      (int unique_confirmed_sigs, confirmed_keys_bits) = check_signatures(order_hash, sigs_dict, pubkeys_dict, confirmed_keys_bits);
+      accept_message();
+      confirmed_sigs += unique_confirmed_sigs;
+      if (confirmed_sigs >= neccessary_sigs_num) {
+        ;; send and delete order
+        send_order(order);
+        (orders_dict, ret) = orders_dict.udict_delete?(256, order_hash);
+        throw_unless(36, ret);
+      }
+      else {
+        ;; update order
+        (orders_dict, ret) = orders_dict.udict_replace_builder?(256, order_hash, begin_cell()
+          .store_uint(expiration_time, 32)
+          .store_uint(confirmed_sigs, 32)
+          .store_uint(confirmed_keys_bits, 256)
+          .store_slice(order));
+        throw_unless(36, ret);
+      }
+    }
+    else {
+      ;; handle new order
+      int cookie = in_msg~load_uint(64);
+      int order_life_time = in_msg~load_uint(32);
+
+      ;; if cookie already exist - drop this msg
+      ;; we must use order cookies for avoid reusing sigs
+      (order_cookies_dict, ret) = order_cookies_dict.udict_add_builder?(64, cookie, begin_cell().store_uint(1, 8));
+      throw_unless(35, ret);
+
+      ;; start check sigs
+      (int confirmed_sigs, int confirmed_keys_bits) = check_signatures(order_hash, sigs_dict, pubkeys_dict, 0);
+      accept_message();
+      if (confirmed_sigs >= neccessary_sigs_num) {
+        send_order(in_msg);
+      }
+      else {
+        ;; create new order
+        int expiration_time = now() + order_life_time;
+        (orders_dict, ret) = orders_dict.udict_add_builder?(256, order_hash, begin_cell()
+          .store_uint(expiration_time, 32)
+          .store_uint(confirmed_sigs, 32)
+          .store_uint(confirmed_keys_bits, 256)
+          .store_slice(in_msg));
+        throw_unless(36, ret);
+      }
+    }
+  }
+  set_data(begin_cell()
+    .store_uint(stored_seqno + 1, 32)
+    .store_uint(neccessary_sigs_num, 32)
+    .store_uint(pubkeys_num, 32)
+    .store_dict(pubkeys_dict)
+    .store_dict(orders_dict)
+    .store_dict(order_cookies_dict)
+    .end_cell());
+}
+
+;; Get methods
+
+int seqno() method_id {
+  return get_data().begin_parse().preload_uint(32);
+}
+
+var get_orders() method_id {
+  (int stored_seqno, int neccessary_sigs_num, int pubkeys_num, cell pubkeys_dict, cell orders_dict, cell order_cookies_dict) = load_data();
+  orders_dict = prune_old_orders(orders_dict);
+  return orders_dict;
+}
+
+var get_orders_by_pub(int pubkey, int signed) method_id {
+  (int stored_seqno, int neccessary_sigs_num, int pubkeys_num, cell pubkeys_dict, cell orders_dict, cell order_cookies_dict) = load_data();
+  orders_dict = prune_old_orders(orders_dict);
+  int pubk_pos = -1;
+  do {
+    int pubk_i = 0;
+    (pubk_pos, slice pubks, int ret) = pubkeys_dict.udict_get_next?(8, pubk_pos);
+    if (ret) {
+      pubk_i = pubks.preload_uint(256);
+    }
+  } until ((~ ret) | (pubkey == pubk_i));
+  int bit_pos = 1 << pubk_pos;
+  int order_key = -1;
+  do {
+    (order_key, slice order, int ret) = orders_dict.udict_get_next?(256, order_key);
+    if (ret) {
+      int delete = 0;
+      int confirmed_keys_bits = order.skip_bits(64).preload_uint(256);
+      if ((confirmed_keys_bits & bit_pos)) {
+        ;; order is signed by following pubkey
+        ifnot (signed) {
+          delete = 1;
+        }
+      }
+      else {
+        ;; order is not signed by following pubkey
+        if (signed) {
+          delete = 1;
+        }
+      }
+      if (delete) {
+        (orders_dict, int res) = orders_dict.udict_delete?(256, order_key);
+        throw_unless(36, ret);
+      }
+    }
+  } until (~ ret);
+  return orders_dict;
+}

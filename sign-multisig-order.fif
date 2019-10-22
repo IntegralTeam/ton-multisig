@@ -1,0 +1,88 @@
+#!/usr/bin/env fift -s
+"TonUtil.fif" include
+
+{ ."usage: " @' $0 type ." <order-file> <privk-file> [-new-seqno <new-seqno>] [<savefile>]" cr
+  ."Significates a multisig order loaded from file <order-file>.boc with private key loaded" cr
+  ."from file <privk-file>.pk and saves it into <savefile>.boc ('signed-order.boc' by default)" cr 1 halt
+} : usage
+
+def? $4
+{
+  @' $3 "-new-seqno" $=
+  {
+    @' $4 parse-int =: new-seqno
+    def? $5 { @' $5 =: $3 [forget] $5 } { [forget] $3 } cond
+    @' $# 2- =: $#
+  } if
+} if
+
+$# dup 2 < swap 3 > or ' usage if
+
+$1 =: order-file
+$2 =: privk-file
+def? $3 { @' $3 } { "signed-order" } cond constant savefile
+3 constant send-mode  // mode for SENDRAWMSG: +1 - sender pays fees, +2 - ignore errors
+// "" 1 { 69091 * 1+ 65535 and tuck 2521 / 65 + hold swap } 1000 times drop =: comment
+
+order-file +".boc" file>B B>boc =: order-message
+privk-file +".pk" load-keypair nip =: privkey
+
+<b
+order-message <s dup ."Original message:" cr csr. cr
+// stack: builder, msg-body
+7 u@+ -rot 7 u, swap // 7bit magic
+8 i@+ 256 u@+ 3 -roll addr, swap // wallet-addr
+Gram@+ -rot Gram, swap // amount
+2 u@+ -rot 2 u, swap // 2bit magic
+32 u@+ -rot // seqno
+def? new-seqno { drop @' new-seqno } if // change seqno if needed
+32 u, swap
+dict@+  // sigs dict
+// stack: builder, sigs-dict, order-body
+dup ."Order body for signing: " csr. cr
+dup =: order-body
+s>c hashu dup ."Order body hash: " . cr
+privkey ed25519_sign_uint // sign order-body
+<b swap B, // put sign to builder
+swap
+// stack: builder, sign, sigs-dict
+0 box constant key
+{
+  over key @ rot 8
+  b>udict!+ // try put sign to dict if key already exist - inc key and try again
+  key 1+!
+} until
+
+nip // delete sign
+dup =: sigs_dict dict, // store sign dict
+order-body s, // store order-body
+b> dup =: external-msg
+
+dup ."resulting external message: " <s csr. cr
+2 boc+>B dup Bx. cr
+savefile +".boc" tuck B>file
+."(Saved to file " type .")" cr
+
+1 halt
+
+// DEBUG
+
+cr cr cr
+."Run TVM enviroment." cr
+
+"Asm.fif" include
+
+"multisig-wallet-code.fif" include =: tvm-code
+"persistent-data.boc" file>B B>boc =: cell-data
+
+external-msg <s 7 u@+ nip 8 i@+ nip 256 u@+ nip Gram@+ nip 2 u@+ nip
+-1 // push receive_external
+
+tvm-code <s
+cell-data
+124711402 0 0 now 1 1 now 50000000000 null pair 0 null 10 tuple single // c7 tuple
+20000 // gas limit
+gasrunvmctx
+drop // drop gas value
+dup ."New storage: " <s csr. cr
+boc>B "persistent-data.boc" B>file

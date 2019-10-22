@@ -1,0 +1,21 @@
+#!/usr/bin/env fift -s
+
+"Asm.fif" include
+"TonUtil.fif" include
+
+."Run TVM enviroment." cr
+
+"multisig-wallet-code.fif" include =: tvm-code
+"persistent-data.boc" file>B B>boc =: cell-data
+
+67442
+ // push
+
+tvm-code <s
+cell-data
+124711402 0 0 now 1 1 now 50000000000 null pair 0 null 10 tuple single // c7 tuple
+10000 // gas limit
+gasrunvmctx
+drop // drop gas value
+dup ."New storage: " <s csr. cr
+boc>B "persistent-data.boc" B>file
