@@ -23,11 +23,12 @@
 
 (cell) prune_old_orders(cell orders_dict) impure {
   int pos = -1;
+  var time = now();
   do {
     (pos, slice order, int ret) = orders_dict.udict_get_next?(256, pos);
     if (ret) {
       var expiration_time = order.preload_uint(32);
-      if (expiration_time <= now()) {
+      if (expiration_time < time) {
         orders_dict~udict_delete?(256, pos);
         ;; throw_unless(36, ret);
       }
@@ -165,13 +166,11 @@ int seqno() method_id {
 
 var get_orders() method_id {
   (int stored_seqno, int neccessary_sigs_num, int pubkeys_num, cell pubkeys_dict, cell orders_dict, cell order_cookies_dict) = load_data();
-  orders_dict = prune_old_orders(orders_dict);
   return orders_dict;
 }
 
 var get_orders_by_pub(int pubkey, int signed) method_id {
   (int stored_seqno, int neccessary_sigs_num, int pubkeys_num, cell pubkeys_dict, cell orders_dict, cell order_cookies_dict) = load_data();
-  orders_dict = prune_old_orders(orders_dict);
   int pubk_pos = -1;
   do {
     int pubk_i = 0;
