@@ -23,14 +23,13 @@
 
 (cell) prune_old_orders(cell orders_dict) impure {
   int pos = -1;
-  int time = now();
   do {
     (pos, slice order, int ret) = orders_dict.udict_get_next?(256, pos);
     if (ret) {
-      int expiration_time = order.preload_uint(32);
-      if (expiration_time <= time) {
-        (orders_dict, ret) = orders_dict.udict_delete?(256, pos);
-        throw_unless(36, ret);
+      var expiration_time = order.preload_uint(32);
+      if (expiration_time <= now()) {
+        orders_dict~udict_delete?(256, pos);
+        ;; throw_unless(36, ret);
       }
     }
   } until (~ ret);
